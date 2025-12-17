@@ -1,0 +1,335 @@
+1)-- find the highest category in each branch,displayimg the branch,category,avg rating
+with cte_tot as(
+select branch,
+category,
+avg(rating) as 2rating,
+rank() over(partition by branch order by avg(rating) desc) as rnk
+from walmart_sales
+group by branch,category
+order by avg(rating) desc
+)
+select  branch,
+category,
+2rating
+from cte_tot where rnk=1;
+
+
+2)-- find the bussiest day of each branch
+with busiest_Day as(
+select
+branch,
+dayname(date) as day_name,
+count(*) as transactions,
+rank() over (
+partition by branch
+order by count(*) desc
+) as rnk
+from walmart_sales
+group by branch, dayname(date)
+)
+select branch,day_name from 
+busiest_day
+where rnk=1
+group by branch,day_name;
+
+3)---- Find the top 3 categories contributing the highest revenue in each city.
+with city_category_rev as (
+select city,
+category,
+sum(amount) as total_rev
+from walmart_sales
+group by city,category
+),
+ranked as(
+select city,
+category,
+total_rev,
+rank() over(partition by city order by total_rev desc ) as rnk
+from city_category_rev
+)
+select city,
+category,
+total_rev
+ from ranked 
+ where rnk<=3
+ order by city, rnk;
+
+
+4)---- Calculate month over month sales growth using date data.
+with monthly_Sales as(
+select date_format(date,"%Y-%m") as date_my,
+sum(amount) as total_sales
+from walmart_sales
+group by  date_format(date,"%Y-%m") 
+),
+monthonmonth as(
+select date_my,
+total_sales,
+lag(total_sales) over (order by date_my) as prev_month_sales,
+(total_sales - lag(total_sales) over (order by date_my)) /
+lag(total_sales) over (order by date_my) as mom_growth
+from monthly_sales
+)
+select
+date_my,
+total_sales,
+prev_month_sales,
+mom_growth
+from monthonmonth
+where prev_month_sales is not null;
+
+
+5)---- Identify low performing product categories by analyzing month over month sales decline and filtering categories 
+-- whose average customer rating falls below a user defined threshold using a parameterized SQL stored procedure. 
+
+
+create procedure low_performing_category(in rating_threshold decimal(3,2))
+begin
+    with monthly_category_sales as (
+select
+category,
+date_format(date,'%Y-%m') as month,
+sum(amount) as total_sales,
+avg(rating) as avg_rating
+from walmart_sales
+group by category, date_format(date,'%Y-%m')
+),
+trend as (
+select
+category,
+month,
+total_sales,
+avg_rating,
+lag(total_sales) over (
+partition by category
+order by month
+) as prev_sales
+from monthly_category_sales
+)
+select
+category,
+avg(avg_rating) as avg_category_rating
+from trend
+where avg_rating < rating_threshold
+and prev_sales is not null
+and total_sales < prev_sales
+group by category;
+
+end :
+
+
+delimiter ;
+
+call low_performing_categories(4);
+
+show procedure status where db = 'walmart';
+
+6)---- Create a profitability index combining amount profit margin and rating.
+select
+category,
+sum(amount) as total_revenue,
+avg(profit_margin) as avg_profit_margin,
+avg(rating) as avg_rating,
+(sum(amount) * avg(profit_margin) * avg(rating)) as profitability_index
+from walmart_sales
+group by category
+order by profitability_index desc;
+
+
+7)---- Identify repeat purchase patterns by checking multiple invoices on the same date and time window.
+
+with ordered_txn as (
+select
+invoice_id,
+branch,
+date,
+time,
+timestamp(date, time) as txn_time,
+lag(timestamp(date, time)) over (
+partition by branch, date
+order by time
+) as prev_txn_time
+from walmart_sales
+)
+select
+branch,
+date,
+invoice_id,
+txn_time,
+prev_txn_time,
+timestampdiff(minute, prev_txn_time, txn_time) as minutes_diff
+from ordered_txn
+where prev_txn_time is not null
+and timestampdiff(minute, prev_txn_time, txn_time) <= 30
+order by branch, date, txn_time;
+
+
+8)-- Detect outlier transactions where unit price or quantity deviates significantly from category average.
+
+with category_stats as (
+select
+category,
+avg(unit_price) as avg_price,
+stddev(unit_price) as std_price,
+avg(quantity) as avg_qty,
+stddev(quantity) as std_qty
+from walmart_sales
+group by category
+)
+select
+w.invoice_id,
+w.category,
+w.unit_price,
+w.quantity,
+c.avg_price,
+c.avg_qty
+from walmart_sales w
+join category_stats c
+on w.category = c.category
+where
+abs(w.unit_price - c.avg_price) > 2 * c.std_price
+or
+abs(w.quantity - c.avg_qty) > 2 * c.std_qty;
+
+9)-- Build a query to calculate customer demand elasticity using unit price and quantity changes.
+
+with monthly_category as (
+select
+category,
+date_format(date,'%Y-%m') as month,
+avg(unit_price) as avg_price,
+sum(quantity) as total_qty
+from walmart_sales
+group by category, date_format(date,'%Y-%m')
+),
+elasticity_base as (
+select
+category,
+month,
+avg_price,
+total_qty,
+lag(avg_price) over (partition by category order by month) as prev_price,
+lag(total_qty) over (partition by category order by month) as prev_qty
+from monthly_category
+)
+select
+category,
+month,
+(avg_price - prev_price) / prev_price as price_change_pct,
+(total_qty - prev_qty) / prev_qty as quantity_change_pct,
+((total_qty - prev_qty) / prev_qty) /
+((avg_price - prev_price) / prev_price) as demand_elasticity
+from elasticity_base
+where prev_price is not null
+and prev_qty is not null
+and prev_price <> 0
+and prev_qty <> 0;
+
+10)-- Compare weekday vs weekend sales performance across branches.
+select
+branch,
+case
+when dayofweek(date) in (1,7) then 'Weekend'
+else 'Weekday'
+end as day_type,
+sum(amount) as total_sales,
+count(*) as total_transactions,
+avg(amount) as avg_transaction_value
+from walmart_sales
+group by
+branch,
+case
+when dayofweek(date) in (1,7) then 'Weekend'
+else 'Weekday'
+end
+order by branch, day_type;
+
+
+11)-- Use CTEs to find cities where revenue growth rate is higher than company average.
+with monthly_city_sales as (
+select
+city,
+date_format(date,'%Y-%m') as month,
+sum(amount) as city_sales
+from walmart_sales
+group by city, date_format(date,'%Y-%m')
+),
+city_growth as (
+select
+city,
+month,
+(city_sales - lag(city_sales) over (partition by city order by month)) /
+lag(city_sales) over (partition by city order by month) as growth_rate
+from monthly_city_sales
+),
+company_avg as (
+select
+avg(growth_rate) as avg_company_growth
+from city_growth
+where growth_rate is not null
+)
+select
+distinct cg.city
+from city_growth cg
+cross join company_avg ca
+where cg.growth_rate > ca.avg_company_growth;
+
+12)-- Identify branches with declining sales trend over consecutive months.
+
+with monthly_branch_sales as (
+select
+branch,
+date_format(date,'%Y-%m') as month,
+sum(amount) as total_sales
+from walmart_sales
+group by branch, date_format(date,'%Y-%m')
+),
+sales_trend as (
+select
+branch,
+month,
+total_sales,
+lag(total_sales) over (
+partition by branch
+order by month
+) as prev_sales
+from monthly_branch_sales
+),
+decline_flag as (
+select
+branch,
+month,
+case
+when prev_sales is not null and total_sales < prev_sales then 1
+else 0
+end as is_decline
+from sales_trend
+)
+select
+branch
+from decline_flag
+group by branch
+having sum(is_decline) >= 2;
+
+13)---- Identify peak sales hours by extracting hour from time and ranking by total revenue.
+with hourly_sales as (
+select
+hour(time) as sales_hour,
+sum(amount) as total_revenue
+from walmart_sales
+group by hour(time)
+),
+ranked as (
+select
+sales_hour,
+total_revenue,
+rank() over (
+order by total_revenue desc
+) as rnk
+from hourly_sales
+)
+select
+sales_hour,
+total_revenue
+from ranked
+where rnk = 1;
